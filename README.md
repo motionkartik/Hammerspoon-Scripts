@@ -1,91 +1,115 @@
 # Spoonfeeder
 
-Automatically load every Hammerspoon Lua script from a dedicated `Spoons` folder, with automatic configuration reloading whenever you make changes.
+A simple Hammerspoon loader that automatically discovers and loads every Lua script inside the `Spoons` directory, including nested folders. It also watches your configuration for changes and reloads Hammerspoon automatically, making development fast and effortless.
 
 Created by **@motionkartik**
 
 ## Features
 
-* Automatically detects and loads every `.lua` file inside the `Spoons` folder
+* Automatically loads every `.lua` file inside the `Spoons` directory and all subfolders
 * No need to manually `require()` or `dofile()` each script
-* Safe loading using `pcall()`, preventing one broken script from stopping the rest
-* Prints successful loads and errors to the Hammerspoon Console
+* Safe loading using `pcall()`, so one broken script won't stop the others
 * Automatically reloads Hammerspoon whenever any Lua file changes
-* Calls `hs.auto_dlp_unload()` before reloading (if available), allowing scripts to clean up timers, watchers, hotkeys, and other resources
-* Displays a confirmation alert after configuration is loaded
+* Calls `hs.auto_dlp_unload()` before reloading (if available) for proper cleanup
+* Prints successful loads and errors to the Hammerspoon Console
+* Displays a confirmation alert after configuration loads
 
-## Folder Structure
+## Repository Structure
 
 ```text
 ~/.hammerspoon/
-│
 ├── init.lua
 └── Spoons/
-    ├── AutoDownloader.lua
-    ├── Clipboard.lua
-    ├── AudioSwitcher.lua
-    ├── WindowManager.lua
-    └── AnyOtherScript.lua
+    ├── Aural/
+    │   ├── Aural.lua
+    │   └── README.md
+    └── Auto_DLP/
+        ├── Auto_DLP.lua
+        └── README.md
 ```
 
-Every `.lua` file inside the `Spoons` folder is automatically loaded.
+Every `.lua` file inside the `Spoons` directory is automatically loaded, regardless of how deeply it is nested.
+
+## Included Spoons
+
+### Aural
+
+A lightweight macOS audio device switcher for Hammerspoon.
+
+Features include:
+
+* Scroll over the menu bar icon to instantly switch audio devices
+* Switch both input and output devices
+* Favorite devices
+* Device overlay notifications
+* Native macOS integration
+
+### Auto_DLP
+
+An automatic clipboard downloader powered by `yt-dlp`.
+
+Features include:
+
+* Watches the clipboard for supported URLs
+* Automatically downloads videos
+* Supports multiple platforms
+* Uses FFmpeg for post processing
+* Download history support
+* Automatic reload friendly
 
 ## Installation
 
-Copy the following loader into your `init.lua`.
+1. Clone this repository into your Hammerspoon configuration directory.
+
+```bash
+git clone <repository-url> ~/.hammerspoon
+```
+
+2. Make sure your `init.lua` contains the Spoonfeeder loader.
+
+3. Reload Hammerspoon.
+
+That's it. Any Lua script added anywhere inside the `Spoons` folder will be loaded automatically.
 
 ## Recommended Folder Naming
 
-Although Spoonfeeder automatically loads every `.lua` file inside the `Spoons` directory, including subfolders, the filesystem does not guarantee the order in which folders are discovered.
-
-If one script depends on another, it is recommended to organize folders with numeric prefixes.
+Although Spoonfeeder automatically loads every Lua script, it is recommended to organize larger projects using numeric prefixes.
 
 Example:
 
 ```text
 Spoons/
 ├── 00_Core/
-│   ├── Config.lua
-│   ├── Logger.lua
-│   └── Helpers.lua
-├── 10_Audio/
-│   └── AudioSwitcher.lua
-├── 20_Clipboard/
-│   └── Clipboard.lua
+├── 10_Aural/
+├── 20_Auto_DLP/
 ├── 30_WindowManagement/
-│   └── Window.lua
-└── 40_Downloaders/
-    └── AutoDownloader.lua
+└── 40_Clipboard/
 ```
 
-This convention makes your project easier to navigate and gives you a predictable structure as it grows.
+This keeps related functionality grouped together and makes large Hammerspoon configurations easier to navigate.
 
-For independent scripts, no prefixes are necessary. They are simply recommended when organizing larger Hammerspoon configurations or grouping related functionality.
-
+For small or independent scripts, prefixes are completely optional.
 
 ## How It Works
 
-### Automatic Script Loading
-
 On startup, Spoonfeeder:
 
-1. Scans the `Spoons` directory.
+1. Recursively scans the `Spoons` directory.
 2. Finds every `.lua` file.
 3. Executes each script using `dofile()`.
-4. Wraps execution with `pcall()` so one failing script does not prevent others from loading.
+4. Wraps execution in `pcall()` so one script failing does not prevent the others from loading.
 
 Example Console output:
 
 ```text
-Loaded: Clipboard.lua
-Loaded: AudioSwitcher.lua
-Loaded: WindowManager.lua
+Loaded: Spoons/Aural/Aural.lua
+Loaded: Spoons/Auto_DLP/Auto_DLP.lua
 ```
 
 If a script contains an error:
 
 ```text
-Error loading Clipboard.lua
+Error loading: Spoons/Aural/Aural.lua
 attempt to index a nil value
 ```
 
@@ -97,40 +121,42 @@ Whenever any `.lua` file changes:
 
 * `hs.auto_dlp_unload()` is called if it exists.
 * Hammerspoon reloads automatically.
-* A confirmation alert is displayed.
+* Your updated scripts are loaded immediately.
 
-This creates a fast development workflow where saving a file immediately reloads your configuration.
+This provides a smooth development workflow where simply saving a file refreshes your entire configuration.
 
-## Optional Cleanup Function
+## Optional Cleanup
 
-If one of your scripts creates timers, watchers, event taps, hotkeys, or other persistent objects, define:
+If one of your scripts creates timers, watchers, hotkeys, event taps, or other persistent resources, expose the following function:
 
 ```lua
 function hs.auto_dlp_unload()
-    -- Cleanup resources here
+    -- Stop timers
+    -- Remove watchers
+    -- Clean up resources
 end
 ```
 
-Spoonfeeder will call it before every reload, helping prevent duplicate timers or leaked resources.
+Spoonfeeder will call it before every reload, helping prevent duplicate timers, duplicate hotkeys, and other leftover resources.
 
 ## Why Spoonfeeder?
 
 Without Spoonfeeder:
 
 ```lua
+require("Aural")
+require("Auto_DLP")
 require("Clipboard")
-require("AudioSwitcher")
-require("WindowManager")
-require("Downloader")
+require("WindowManagement")
 require("MediaKeys")
 ...
 ```
 
-Every new script requires another line in `init.lua`.
+Every new script requires another line inside `init.lua`.
 
 With Spoonfeeder:
 
-Simply drop a `.lua` file into the `Spoons` folder and it is loaded automatically.
+Simply drop a `.lua` file anywhere inside the `Spoons` folder and it will be discovered and loaded automatically.
 
 ## Requirements
 
