@@ -1,5 +1,4 @@
 -- Aural by @motionkartik
--- Modified to include inverted volume control via mouse scroll on the menubar icon
 
 local aural = {}
 
@@ -148,57 +147,136 @@ local function categoryForDevice(dev)
    return "default"
 end
 
+-- Safely get volume string (returns nil if unsupported)
+local function getVolumeString(dev)
+    if not dev then return nil end
+    local ok, vol = pcall(function() return dev:volume() end)
+    if not ok or type(vol) ~= "number" then return nil end
+    return math.floor(vol) .. "%"
+end
+
 -- ── HUD: a transient ──
-function aural.showHUD(category, deviceName)
-   if aural.hudTimer then aural.hudTimer:stop() end
-   if aural.hud then aural.hud:delete() end
+function aural.hideHUD()
+    if aural.hudTimer then aural.hudTimer:stop() end
+    if aural.hud then
+        local canvas = aural.hud
+        canvas:hide(0.25)
+        hs.timer.doAfter(0.3, function()
+            if aural.hud == canvas then
+                canvas:delete()
+                aural.hud = nil
+            end
+        end)
+    end
+end
 
-   local w, h = 200, 150
-   local screenFrame = hs.screen.mainScreen():frame()
-   local x = screenFrame.x + (screenFrame.w - w) / 2
-   local y = screenFrame.y + (screenFrame.h - h) / 2
+function aural.showHUD(category, deviceName, volumeText)
+    if aural.hudTimer then aural.hudTimer:stop() end
+    if aural.hud then aural.hud:delete() end
 
-   local canvas = hs.canvas.new({ x = x, y = y, w = w, h = h })
+    local w, h = 200, 150
+    local screenFrame = hs.screen.mainScreen():frame()
+    local x = screenFrame.x + (screenFrame.w - w) / 2
+    local y = screenFrame.y + (screenFrame.h - h) / 2
 
-   canvas:appendElements({
-       type = "rectangle",
-       action = "fill",
-       fillColor = { white = 0.1, alpha = 0.85 },
-       roundedRectRadii = { xRadius = 22, yRadius = 22 },
-   })
+    local canvas = hs.canvas.new({ x = x, y = y, w = w, h = h })
 
-   local icon = ensureIcon(category, "hud")
-   if icon then
-       canvas:appendElements({
-           type = "image",
-           image = icon,
-           frame = { x = w / 2 - 28, y = 26, w = 56, h = 56 },
-       })
-   end
+    canvas:appendElements({
+        type = "rectangle",
+        action = "fill",
+        fillColor = { white = 0.1, alpha = 0.85 },
+        roundedRectRadii = { xRadius = 22, yRadius = 22 },
+    })
 
-   canvas:appendElements({
-       type = "text",
-       text = deviceName or "",
-       textSize = 14,
-       textColor = { white = 1, alpha = 1 },
-       textAlignment = "center",
-       frame = { x = 8, y = 98, w = w - 16, h = 36 },
-   })
+    local icon = ensureIcon(category, "hud")
+    if icon then
+        canvas:appendElements({
+            type = "image",
+            image = icon,
+            frame = { x = w / 2 - 28, y = 18, w = 56, h = 56 },
+        })
+    end
 
-   canvas:level(hs.canvas.windowLevels.overlay)
-   canvas:clickActivating(false)
-   canvas:show(0.12)
-   aural.hud = canvas
+    -- Device Name
+    canvas:appendElements({
+        type = "text",
+        text = deviceName or "",
+        textSize = 14,
+        textColor = { white = 1, alpha = 1 },
+        textAlignment = "center",
+        frame = { x = 8, y = 80, w = w - 16, h = 20 },
+    })
 
-   aural.hudTimer = hs.timer.doAfter(1.1, function()
-       canvas:hide(0.25)
-       hs.timer.doAfter(0.3, function()
-           if aural.hud == canvas then
-               canvas:delete()
-               aural.hud = nil
-           end
-       end)
-   end)
+    -- Volume Text (only if the device supports it)
+    if volumeText then
+        canvas:appendElements({
+            type = "text",
+            text = volumeText,
+            textSize = 20,
+            textColor = { white = 1, alpha = 0.9 },
+            textAlignment = "center",
+            frame = { x = 8, y = 105, w = w - 16, h = 28 },
+        })
+    end
+
+    canvas:level(hs.canvas.windowLevels.overlay)
+    canvas:clickActivating(false)
+    canvas:show(0.12)
+    aural.hud = canvas
+
+    aural.hudTimer = hs.timer.doAfter(1.1, function()
+        aural.hideHUD()
+    end)
+end
+
+-- Update the existing HUD in place to prevent flickering during scroll
+function aural.updateHUD(category, deviceName, volumeText)
+    if not aural.hud then
+        aural.showHUD(category, deviceName, volumeText)
+        return
+    end
+
+    if aural.hudTimer then aural.hudTimer:stop() end
+
+    -- Update Icon
+    local icon = ensureIcon(category, "hud")
+    if icon then
+        aural.hud[2] = {
+            type = "image",
+            image = icon,
+            frame = { x = 100 - 28, y = 18, w = 56, h = 56 },
+        }
+    end
+
+    -- Update Device Name
+    aural.hud[3] = {
+        type = "text",
+        text = deviceName or "",
+        textSize = 14,
+        textColor = { white = 1, alpha = 1 },
+        textAlignment = "center",
+        frame = { x = 8, y = 80, w = 200 - 16, h = 20 },
+    }
+
+    -- Update Volume Text
+    if volumeText then
+        aural.hud[4] = {
+            type = "text",
+            text = volumeText,
+            textSize = 20,
+            textColor = { white = 1, alpha = 0.9 },
+            textAlignment = "center",
+            frame = { x = 8, y = 105, w = 200 - 16, h = 28 },
+        }
+    else
+        -- If device doesn't support volume, clear the text element
+        aural.hud[4] = nil
+    end
+
+    -- Reset the timer to keep it on screen
+    aural.hudTimer = hs.timer.doAfter(1.1, function()
+        aural.hideHUD()
+    end)
 end
 
 -- ── Menubar item
@@ -247,7 +325,7 @@ function aural.updateIcon()
    if uid ~= aural.lastDeviceUID then
        aural.lastDeviceUID = uid
        if current and aural.hudEnabled then
-           aural.showHUD(category, current:name())
+           aural.showHUD(category, current:name(), getVolumeString(current))
        end
    end
 end
@@ -288,6 +366,13 @@ local function adjustVolume(direction)
    -- Adjust volume by 5 units per scroll tick
    vol = math.max(0, math.min(100, vol + (direction * 5)))
    current:setVolume(vol)
+   
+   -- Update live HUD smoothly while scrolling
+   if aural.hudEnabled then
+       local category = categoryForDevice(current)
+       local name = current:name()
+       aural.updateHUD(category, name, getVolumeString(current))
+   end
 end
 
 -- ── Right click = pop up the full device list, Scroll = volume ──
