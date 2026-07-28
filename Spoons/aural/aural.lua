@@ -176,8 +176,26 @@ function aural.showHUD(category, deviceName, volumeText)
 
     local w, h = 200, 150
     local screenFrame = hs.screen.mainScreen():frame()
-    local x = screenFrame.x + (screenFrame.w - w) / 2
-    local y = screenFrame.y + (screenFrame.h - h) / 2
+    local x, y
+
+    -- Get menubar frame to position HUD underneath it
+    local ok, mbFrame = pcall(function() return aural.menubar:frame() end)
+    
+    if ok and mbFrame then
+        -- Position horizontally centered under the menubar icon
+        x = mbFrame.x + (mbFrame.w / 2) - (w / 2)
+        -- Position vertically just below the menubar
+        y = mbFrame.y + mbFrame.h + 4
+    else
+        -- Fallback to center of screen if menubar frame can't be found
+        x = screenFrame.x + (screenFrame.w - w) / 2
+        y = screenFrame.y + (screenFrame.h - h) / 2
+    end
+
+    -- Keep it from going off the left/right edges of the screen
+    x = math.max(screenFrame.x + 4, math.min(x, screenFrame.x + screenFrame.w - w - 4))
+    -- Keep it from going off the top of the screen (e.g., MacBooks with a notch)
+    y = math.max(screenFrame.y, y)
 
     local canvas = hs.canvas.new({ x = x, y = y, w = w, h = h })
 
@@ -238,13 +256,15 @@ function aural.updateHUD(category, deviceName, volumeText)
 
     if aural.hudTimer then aural.hudTimer:stop() end
 
+    local w = 200
+    
     -- Update Icon
     local icon = ensureIcon(category, "hud")
     if icon then
         aural.hud[2] = {
             type = "image",
             image = icon,
-            frame = { x = 100 - 28, y = 18, w = 56, h = 56 },
+            frame = { x = w / 2 - 28, y = 18, w = 56, h = 56 },
         }
     end
 
@@ -255,7 +275,7 @@ function aural.updateHUD(category, deviceName, volumeText)
         textSize = 14,
         textColor = { white = 1, alpha = 1 },
         textAlignment = "center",
-        frame = { x = 8, y = 80, w = 200 - 16, h = 20 },
+        frame = { x = 8, y = 80, w = w - 16, h = 20 },
     }
 
     -- Update Volume Text
@@ -266,7 +286,7 @@ function aural.updateHUD(category, deviceName, volumeText)
             textSize = 20,
             textColor = { white = 1, alpha = 0.9 },
             textAlignment = "center",
-            frame = { x = 8, y = 105, w = 200 - 16, h = 28 },
+            frame = { x = 8, y = 105, w = w - 16, h = 28 },
         }
     else
         -- If device doesn't support volume, clear the text element
