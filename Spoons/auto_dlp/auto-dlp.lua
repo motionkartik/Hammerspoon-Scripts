@@ -76,12 +76,24 @@ local menubar          = hs.menubar.new()
 local queue            = {}    
 local history          = {}
 local pendingBatch     = nil
+local pendingBatchMode = nil    -- mode the pending batch was detected under ("video" / "audio"), locked at detection time
 local pendingTimer     = nil
-local monitoringPaused = true
-local audioOnlyMode    = false
+
+-- mode: "idle" | "video" | "audio"
+local MODES  = { "idle", "video", "audio" }
+local mode   = "idle"
+
+local ICONS = {
+  idle  = "⏸",
+  video = "▶",
+  audio = "♪",
+}
+
+local lastMenu = {}   -- most recently built menu table, shown on right-click via popupMenu
 
 local activeSlots = {}
 local clipboardWatcher = nil
+local rightClickWatcher = nil
 
 local function activeCount()
   local n = 0
@@ -94,8 +106,8 @@ local function notify(title, text)
   hs.notify.new({ title = title, informativeText = text }):send()
 end
 
-local function notifyDetected(urls)
-  local modeTag = audioOnlyMode and " [MP3]" or " [MP4]"
+local function notifyDetected(urls, batchMode)
+  local modeTag = (batchMode == "audio") and " Audio" or " Video"
   hs.notify.new(
       function(n)
           if n:activationType() == hs.notify.activationTypes.actionButtonClicked then
@@ -105,8 +117,8 @@ local function notifyDetected(urls)
           end
       end,
       {
-          title             = "Videos Detected",
-          informativeText   = #urls .. " download(s) queued" .. modeTag,
+          title             = "Media Detected",
+          informativeText   = #urls .. " download(s) queued -" .. modeTag,
           actionButtonTitle = "Cancel",
           hasActionButton   = true,
           alwaysPresent     = true,
@@ -115,7 +127,7 @@ local function notifyDetected(urls)
 end
 
 local function notifyComplete(filePath, downloadAudioOnly)
-  local name = filePath:match("([^/]+)$") or (downloadAudioOnly and "Audio (MP3)" or "Video")
+  local name = filePath:match("([^/]+)$") or (downloadAudioOnly and "Audio" or "Video")
   hs.notify.new(
       function(n)
           local t = n:activationType()
@@ -221,23 +233,25 @@ function updateMenu()
   -- Sum total active downloads, queued downloads, and pending batch items
   local total = #queue + (pendingBatch and #pendingBatch or 0) + ac
 
-  -- Simplified counter: just shows total media in system
-  local title = "⬇︎ " .. total
-  if menubar then menubar:setTitle(title) end
+  if menubar then
+      menubar:setTitle(ICONS[mode] .. " " .. total)
+  end
 
   local menu = {}
 
   if pendingBatch then
-      table.insert(menu, { title = "Pending Batch (" .. #pendingBatch .. ")" })
+      local batchTag = (pendingBatchMode == "audio") and " Audio" or " Video"
+      table.insert(menu, { title = "Pending Batch (" .. #pendingBatch .. ")" .. batchTag })
 
       table.insert(menu, {
           title = "Start Now",
           fn = function()
               if pendingTimer then pendingTimer:stop(); pendingTimer = nil end
               for _, url in ipairs(pendingBatch) do
-                  table.insert(queue, { url = url, audioOnly = audioOnlyMode })
+                  table.insert(queue, { url = url, audioOnly = (pendingBatchMode == "audio") })
               end
               pendingBatch = nil
+              pendingBatchMode = nil
               processQueue()
           end
       })
@@ -247,6 +261,7 @@ function updateMenu()
           fn = function()
               if pendingTimer then pendingTimer:stop(); pendingTimer = nil end
               pendingBatch = nil
+              pendingBatchMode = nil
               updateMenu()
           end
       })
@@ -255,19 +270,16 @@ function updateMenu()
   end
 
   table.insert(menu, {
-      title = monitoringPaused and "Not Monitoring" or "✓ Monitoring",
-      fn = function()
-          monitoringPaused = not monitoringPaused
-          updateMenu()
-      end
+      title = (mode == "idle") and "✓ Idle" or "Idle",
+      fn = function() mode = "idle"; updateMenu() end
   })
-
   table.insert(menu, {
-      title = audioOnlyMode and "✓ Audio" or "✓ Video",
-      fn = function()
-          audioOnlyMode = not audioOnlyMode
-          updateMenu()
-      end
+      title = (mode == "video") and "✓ Video" or "Video",
+      fn = function() mode = "video"; updateMenu() end
+  })
+  table.insert(menu, {
+      title = (mode == "audio") and "✓ Audio" or "Audio",
+      fn = function() mode = "audio"; updateMenu() end
   })
 
   table.insert(menu, { title = "-" })
@@ -295,7 +307,7 @@ function updateMenu()
       fn = function() hs.execute('open "' .. DOWNLOAD_DIR .. '"') end
   })
 
-  if menubar then menubar:setMenu(menu) end
+  lastMenu = menu
 end
 
 -- Parallel download engine
@@ -310,7 +322,7 @@ function processQueue()
       local slotId = url
 
       notify("Download Started",
-          (downloadAudioOnly and "[MP3] " or "[MP4] ") .. url)
+          (downloadAudioOnly and "Audio" or "Video") .. " " .. url)
 
       local args = buildArgs(url, downloadAudioOnly)
 
@@ -333,7 +345,7 @@ function processQueue()
 
               print("================================")
               print("URL:",  url)
-              print("Mode:", downloadAudioOnly and "Audio Only (MP3)" or "Video (MP4)")
+              print("Mode:", downloadAudioOnly and "Audio" or "Video")
               print("Exit:", exitCode)
               if stdout and stdout ~= "" then print(stdout) end
               if stderr and stderr ~= "" then print(stderr) end
@@ -371,6 +383,10 @@ function hs.auto_dlp_unload()
        clipboardWatcher:stop()
        clipboardWatcher = nil
    end
+   if rightClickWatcher then
+       rightClickWatcher:stop()
+       rightClickWatcher = nil
+   end
    if pendingTimer then
        pendingTimer:stop()
        pendingTimer = nil
@@ -397,7 +413,7 @@ cleanupTempFiles()
 hs.timer.doEvery(86400, cleanupTempFiles)
 
 clipboardWatcher = hs.pasteboard.watcher.new(function()
-  if monitoringPaused then return end
+  if mode == "idle" then return end   -- Idle = monitoring off
 
   local clipboard = hs.pasteboard.getContents()
   if not clipboard or #clipboard < 10 then return end
@@ -426,24 +442,70 @@ clipboardWatcher = hs.pasteboard.watcher.new(function()
   if #urls == 0 then return end
 
   if pendingTimer then pendingTimer:stop() end
-  pendingBatch = urls
-  notifyDetected(urls)
+  pendingBatch     = urls
+  pendingBatchMode = mode   -- lock batch to whatever mode was active at detection time
+  notifyDetected(urls, pendingBatchMode)
   updateMenu()
 
   pendingTimer = hs.timer.doAfter(COUNTDOWN_SECONDS, function()
       if not pendingBatch then return end
 
+      local batchAudioOnly = (pendingBatchMode == "audio")
       for _, url in ipairs(pendingBatch) do
-          table.insert(queue, { url = url, audioOnly = audioOnlyMode })
+          table.insert(queue, { url = url, audioOnly = batchAudioOnly })
       end
-      pendingBatch = nil
-      pendingTimer = nil
+      pendingBatch     = nil
+      pendingBatchMode = nil
+      pendingTimer     = nil
 
       processQueue()
   end)
 end)
 
 clipboardWatcher:start()
-updateMenu()
-notify("Auto-dlp started", "Turn on Monitoring from menu bar")
 
+-- ── Left click = cycle Idle → Video → Audio → Idle ──
+local function cycleMode()
+  local currentIndex = 1
+  for i, m in ipairs(MODES) do
+      if m == mode then currentIndex = i; break end
+  end
+  mode = MODES[(currentIndex % #MODES) + 1]
+  updateMenu()
+end
+
+if menubar then
+  -- setClickCallback fires on left click (setMenu is intentionally never
+  -- attached, otherwise it would hijack left-click too).
+  menubar:setClickCallback(function(_mods)
+      cycleMode()
+  end)
+end
+
+-- ── Right click = pop up the full menu ──
+local function isMouseOverMenubar()
+  if not menubar then return false end
+  local frame = menubar:frame()
+  if not frame then return false end
+  local loc = hs.mouse.absolutePosition()
+  return loc.x >= frame.x and loc.x <= frame.x + frame.w
+      and loc.y >= frame.y and loc.y <= frame.y + frame.h
+end
+
+rightClickWatcher = hs.eventtap.new(
+  { hs.eventtap.event.types.rightMouseUp },
+  function(event)
+      if isMouseOverMenubar() and menubar then
+          menubar:setMenu(lastMenu)
+          menubar:popupMenu(hs.mouse.absolutePosition())
+          -- Detach again so a subsequent LEFT click falls through to
+          -- setClickCallback's cycle behavior instead of reopening this menu.
+          menubar:setMenu(nil)
+      end
+      return false
+  end
+)
+rightClickWatcher:start()
+
+updateMenu()
+notify("Auto-dlp started", "Left-click the menu bar icon to switch modes")
