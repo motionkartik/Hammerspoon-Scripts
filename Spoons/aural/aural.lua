@@ -152,7 +152,21 @@ local function getVolumeString(dev)
     if not dev then return nil end
     local ok, vol = pcall(function() return dev:volume() end)
     if not ok or type(vol) ~= "number" then return nil end
+
+    local mutedOk, muted = pcall(function() return dev:muted() end)
+    if mutedOk and muted then
+        return "Muted"
+    end
+
     return math.floor(vol) .. "%"
+end
+
+-- Safely get mute state (returns false if unsupported)
+local function isMuted(dev)
+    if not dev then return false end
+    local ok, muted = pcall(function() return dev:muted() end)
+    if not ok then return false end
+    return muted == true
 end
 
 -- ── HUD: a transient ──
@@ -302,6 +316,7 @@ end
 -- ── Menubar item
 aural.menubar = hs.menubar.new()
 aural.lastDeviceUID = nil
+aural.lastMuted = false
 
 local function switchTo(dev)
    return function()
@@ -342,8 +357,11 @@ function aural.updateIcon()
    aural.menubar:setTooltip(current and ("Aural — " .. current:name()) or "Aural")
 
    local uid = current and current:uid() or nil
-   if uid ~= aural.lastDeviceUID then
+   local muted = isMuted(current)
+
+   if uid ~= aural.lastDeviceUID or muted ~= aural.lastMuted then
        aural.lastDeviceUID = uid
+       aural.lastMuted = muted
        if current and aural.hudEnabled then
            aural.showHUD(category, current:name(), getVolumeString(current))
        end
@@ -382,7 +400,17 @@ local function adjustVolume(direction)
    
    local ok, vol = pcall(function() return current:volume() end)
    if not ok or type(vol) ~= "number" then return end
-   
+
+   -- Scrolling implies intent to hear sound — unmute first, otherwise
+   -- setVolume() below has no audible effect even though the number changes.
+   -- Start from 0 (not the pre-mute level) so unmuting-by-scroll never
+   -- blasts audio back in at whatever volume it was left at.
+   if isMuted(current) then
+       pcall(function() current:setMuted(false) end)
+       aural.lastMuted = false
+       vol = 0
+   end
+
    -- Adjust volume by 5 units per scroll tick
    vol = math.max(0, math.min(100, vol + (direction * 5)))
    current:setVolume(vol)
@@ -457,7 +485,9 @@ hs.audiodevice.watcher.start()
 aural.hudEnabled = true
 
 -- initial paint on load
-aural.lastDeviceUID = hs.audiodevice.defaultOutputDevice() and hs.audiodevice.defaultOutputDevice():uid() or nil
-aural.menubar:setIcon(ensureIcon(categoryForDevice(hs.audiodevice.defaultOutputDevice()), "menubar"), true)
+local initialDevice = hs.audiodevice.defaultOutputDevice()
+aural.lastDeviceUID = initialDevice and initialDevice:uid() or nil
+aural.lastMuted = isMuted(initialDevice)
+aural.menubar:setIcon(ensureIcon(categoryForDevice(initialDevice), "menubar"), true)
 
 return aural
