@@ -585,4 +585,6 @@ if initialIcon then
     aural.menubar:setIcon(initialIcon, true)
 end
 
+_G.aural = aural
+
 return aural
