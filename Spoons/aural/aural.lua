@@ -2,6 +2,15 @@
 
 local aural = {}
 
+-- Set to true for verbose console logging while debugging.
+aural.debug = false
+
+local function log(...)
+    if aural.debug then
+        print("[Aural]", ...)
+    end
+end
+
 -- ── Paths ──
 
 local function scriptDir()
@@ -91,6 +100,9 @@ local VARIANTS = {
    hud     = { pointSize = 44, color = "white" },
 }
 
+-- IMPORTANT: only successfully-loaded hs.image objects are cached.
+-- A failed render (nil image) is never cached, so the next call retries
+-- generation instead of permanently serving a blank/missing icon.
 local iconCache = {}
 
 local function ensureIcon(category, variant)
@@ -99,9 +111,12 @@ local function ensureIcon(category, variant)
 
    local path = ICON_DIR .. category .. "-" .. variant .. ".png"
    local f = io.open(path, "r")
+   local fileWasPresent = f ~= nil
    if f then
        f:close()
-   else
+   end
+
+   if not fileWasPresent then
        local spec = VARIANTS[variant]
        local symbolName = SYMBOLS[category] or SYMBOLS.default
        local cmd = string.format(
@@ -114,10 +129,17 @@ local function ensureIcon(category, variant)
        if not ok then
            local detail = output ~= "" and (" — " .. output:gsub("%s+$", "")) or " (no output — check the binary exists and is executable)"
            hs.alert.show("Aural: couldn't render " .. symbolName .. detail)
+           log("icon render failed for", cacheKey, detail)
+           return nil -- do not cache a failure
        end
    end
 
    local img = hs.image.imageFromPath(path)
+   if not img then
+       log("hs.image.imageFromPath returned nil for", path, "— not caching, will retry next time")
+       return nil -- do not cache a failure
+   end
+
    iconCache[cacheKey] = img
    return img
 end
@@ -169,6 +191,37 @@ local function isMuted(dev)
     return muted == true
 end
 
+-- Some devices (notably virtual ones left behind by apps like Zoom after
+-- they exit) stay in hs.audiodevice.allOutputDevices() even though macOS's
+-- own Sound menu no longer lists them as real outputs. Trying to switch to
+-- one silently fails. A device with 0 output channels is our best signal
+-- that it's a dead/torn-down device, so we filter those out everywhere.
+-- UIDs of devices that have failed a verified switch 3 times in this
+-- Hammerspoon session. Populated by setDefaultOutputVerified below.
+aural.deadDeviceUIDs = {}
+
+local function isUsableOutputDevice(dev)
+    if not dev then return false end
+    if aural.deadDeviceUIDs[dev:uid()] then return false end
+    local ok, channels = pcall(function() return dev:outputChannels() end)
+    if not ok or type(channels) ~= "number" then
+        -- If we can't tell, don't exclude it — better to attempt and let
+        -- the verified-switch retry/alert logic catch a real failure.
+        return true
+    end
+    return channels > 0
+end
+
+local function usableOutputDevices()
+    local usable = {}
+    for _, dev in ipairs(hs.audiodevice.allOutputDevices()) do
+        if isUsableOutputDevice(dev) then
+            table.insert(usable, dev)
+        end
+    end
+    return usable
+end
+
 -- ── HUD: a transient ──
 function aural.hideHUD()
     if aural.hudTimer then aural.hudTimer:stop() end
@@ -194,7 +247,7 @@ function aural.showHUD(category, deviceName, volumeText)
 
     -- Get menubar frame to position HUD underneath it
     local ok, mbFrame = pcall(function() return aural.menubar:frame() end)
-    
+
     if ok and mbFrame then
         -- Position horizontally centered under the menubar icon
         x = mbFrame.x + (mbFrame.w / 2) - (w / 2)
@@ -271,7 +324,7 @@ function aural.updateHUD(category, deviceName, volumeText)
     if aural.hudTimer then aural.hudTimer:stop() end
 
     local w = 200
-    
+
     -- Update Icon
     local icon = ensureIcon(category, "hud")
     if icon then
@@ -318,16 +371,74 @@ aural.menubar = hs.menubar.new()
 aural.lastDeviceUID = nil
 aural.lastMuted = false
 
+-- Repaint the menubar icon/tooltip, and pop the HUD if the device actually changed.
+-- Always sets the icon (even if unchanged) so a previously-failed render gets
+-- a chance to repaint on the next natural update instead of staying stuck.
+function aural.updateIcon()
+   local current = hs.audiodevice.defaultOutputDevice()
+   local category = categoryForDevice(current)
+
+   local icon = ensureIcon(category, "menubar")
+   if icon then
+       aural.menubar:setIcon(icon, true)
+   else
+       log("no menubar icon available for category", category, "— leaving previous icon in place")
+   end
+   aural.menubar:setTooltip(current and ("Aural — " .. current:name()) or "Aural")
+
+   local uid = current and current:uid() or nil
+   local muted = isMuted(current)
+
+   if uid ~= aural.lastDeviceUID or muted ~= aural.lastMuted then
+       log("device/mute state changed:", aural.lastDeviceUID, "->", uid, "muted:", muted)
+       aural.lastDeviceUID = uid
+       aural.lastMuted = muted
+       if current and aural.hudEnabled then
+           aural.showHUD(category, current:name(), getVolumeString(current))
+       end
+   end
+end
+
+-- Switch default output device, then verify it actually took hold.
+-- setDefaultOutputDevice() can occasionally fail silently (e.g. a device
+-- that just disconnected, or one CoreAudio momentarily refuses); a couple
+-- of short-delay retries make the switch reliable without adding
+-- noticeable click latency.
+local function setDefaultOutputVerified(dev, attempt)
+    attempt = attempt or 1
+    if not dev then return end
+
+    local targetUID = dev:uid()
+    dev:setDefaultOutputDevice()
+
+    hs.timer.doAfter(0.12, function()
+        local now = hs.audiodevice.defaultOutputDevice()
+        if now and now:uid() == targetUID then
+            log("switch to", dev:name(), "confirmed on attempt", attempt)
+            aural.updateIcon()
+            return
+        end
+
+        log("switch to", dev:name(), "did not take on attempt", attempt)
+        if attempt < 3 then
+            setDefaultOutputVerified(dev, attempt + 1)
+        else
+            hs.alert.show("Aural: couldn't switch to " .. dev:name() .. " — skipping it from now on")
+            aural.deadDeviceUIDs[targetUID] = true
+            aural.updateIcon()
+        end
+    end)
+end
+
 local function switchTo(dev)
    return function()
-       dev:setDefaultOutputDevice()
-       aural.updateIcon()
+       setDefaultOutputVerified(dev)
    end
 end
 
 local function buildMenu()
    local current = hs.audiodevice.defaultOutputDevice()
-   local devices = hs.audiodevice.allOutputDevices()
+   local devices = usableOutputDevices()
    local menuItems = {}
 
    for _, dev in ipairs(devices) do
@@ -348,29 +459,9 @@ local function buildMenu()
    return menuItems
 end
 
--- Repaint the menubar icon/tooltip, and pop the HUD if the device actually changed
-function aural.updateIcon()
-   local current = hs.audiodevice.defaultOutputDevice()
-   local category = categoryForDevice(current)
-
-   aural.menubar:setIcon(ensureIcon(category, "menubar"), true)
-   aural.menubar:setTooltip(current and ("Aural — " .. current:name()) or "Aural")
-
-   local uid = current and current:uid() or nil
-   local muted = isMuted(current)
-
-   if uid ~= aural.lastDeviceUID or muted ~= aural.lastMuted then
-       aural.lastDeviceUID = uid
-       aural.lastMuted = muted
-       if current and aural.hudEnabled then
-           aural.showHUD(category, current:name(), getVolumeString(current))
-       end
-   end
-end
-
 -- ── Left click = instant cycle to next device ──
 local function cycleToNext()
-   local devices = hs.audiodevice.allOutputDevices()
+   local devices = usableOutputDevices()
    if #devices == 0 then return end
 
    local current = hs.audiodevice.defaultOutputDevice()
@@ -385,8 +476,8 @@ local function cycleToNext()
    end
 
    local nextDevice = devices[(currentIndex % #devices) + 1]
-   nextDevice:setDefaultOutputDevice()
-   aural.updateIcon()
+   log("cycling from", current and current:name() or "nil", "to", nextDevice:name())
+   setDefaultOutputVerified(nextDevice)
 end
 
 aural.menubar:setClickCallback(function(_mods)
@@ -397,7 +488,7 @@ end)
 local function adjustVolume(direction)
    local current = hs.audiodevice.defaultOutputDevice()
    if not current then return end
-   
+
    local ok, vol = pcall(function() return current:volume() end)
    if not ok or type(vol) ~= "number" then return end
 
@@ -414,7 +505,7 @@ local function adjustVolume(direction)
    -- Adjust volume by 5 units per scroll tick
    vol = math.max(0, math.min(100, vol + (direction * 5)))
    current:setVolume(vol)
-   
+
    -- Update live HUD smoothly while scrolling
    if aural.hudEnabled then
        local category = categoryForDevice(current)
@@ -427,15 +518,15 @@ end
 local function isMouseOverMenubar()
    local frame = aural.menubar:frame()
    if not frame then return false end
-   
+
    local loc = hs.mouse.absolutePosition()
    return loc.x >= frame.x and loc.x <= frame.x + frame.w
       and loc.y >= frame.y and loc.y <= frame.y + frame.h
 end
 
-aural.rightClickWatcher = hs.eventtap.new({ 
-   hs.eventtap.event.types.rightMouseUp, 
-   hs.eventtap.event.types.scrollWheel 
+aural.rightClickWatcher = hs.eventtap.new({
+   hs.eventtap.event.types.rightMouseUp,
+   hs.eventtap.event.types.scrollWheel
 }, function(event)
    local eventType = event:getType()
 
@@ -443,15 +534,15 @@ aural.rightClickWatcher = hs.eventtap.new({
    if eventType == hs.eventtap.event.types.scrollWheel then
        if isMouseOverMenubar() then
            local direction = event:getProperty(hs.eventtap.event.properties.scrollWheelEventDeltaAxis1)
-           
+
            if direction < 0 then
                adjustVolume(-1) -- Scroll up = Volume down (Inverted)
            elseif direction > 0 then
                adjustVolume(1)  -- Scroll down = Volume up (Inverted)
            end
-           
+
            -- Return true to swallow the event so the background app doesn't also scroll
-           return true 
+           return true
        end
        return false
    end
@@ -476,7 +567,8 @@ aural.rightClickWatcher:start()
 
 -- ── Watcher ──
 
-hs.audiodevice.watcher.setCallback(function(_event)
+hs.audiodevice.watcher.setCallback(function(event)
+   log("CoreAudio watcher event:", event)
    aural.updateIcon()
 end)
 hs.audiodevice.watcher.start()
@@ -488,6 +580,9 @@ aural.hudEnabled = true
 local initialDevice = hs.audiodevice.defaultOutputDevice()
 aural.lastDeviceUID = initialDevice and initialDevice:uid() or nil
 aural.lastMuted = isMuted(initialDevice)
-aural.menubar:setIcon(ensureIcon(categoryForDevice(initialDevice), "menubar"), true)
+local initialIcon = ensureIcon(categoryForDevice(initialDevice), "menubar")
+if initialIcon then
+    aural.menubar:setIcon(initialIcon, true)
+end
 
 return aural
