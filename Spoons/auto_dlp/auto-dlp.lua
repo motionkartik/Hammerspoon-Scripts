@@ -176,6 +176,8 @@ showNextNotification = function()
       frame = { x = NOTIF_PAD, y = NOTIF_PAD + 2, w = NOTIF_ICON, h = NOTIF_ICON },
   })
 
+  local CLOSE_SIZE = 20
+
   canvas:appendElements({
       type = "text",
       text = spec.title or "",
@@ -184,7 +186,32 @@ showNextNotification = function()
       textAlignment = "left",
       textLineBreak = "truncateTail",
       frame = { x = NOTIF_PAD + NOTIF_ICON + 10, y = NOTIF_PAD + 2,
-                w = NOTIF_WIDTH - NOTIF_PAD * 2 - NOTIF_ICON - 10, h = 22 },
+                w = NOTIF_WIDTH - NOTIF_PAD * 2 - NOTIF_ICON - 10 - CLOSE_SIZE - 6, h = 22 },
+  })
+
+  -- Small "x" close control, top-right corner. Tracked like the action
+  -- buttons but wired directly to dismissNotification (no spec.fn), so it
+  -- always just closes the panel rather than triggering the notif's action.
+  canvas:appendElements({
+      type = "rectangle",
+      action = "fill",
+      id = "closeBtn",
+      trackMouseUp = true,
+      trackMouseEnterExit = true,
+      fillColor = { white = 1, alpha = 0 },
+      roundedRectRadii = { xRadius = 6, yRadius = 6 },
+      frame = { x = NOTIF_WIDTH - NOTIF_PAD - CLOSE_SIZE, y = NOTIF_PAD - 4,
+                w = CLOSE_SIZE, h = CLOSE_SIZE },
+  })
+
+  canvas:appendElements({
+      type = "text",
+      text = "✕",
+      textSize = 12,
+      textColor = { white = 0.85, alpha = 1 },
+      textAlignment = "center",
+      frame = { x = NOTIF_WIDTH - NOTIF_PAD - CLOSE_SIZE, y = NOTIF_PAD - 3,
+                w = CLOSE_SIZE, h = CLOSE_SIZE },
   })
 
   local textW = NOTIF_WIDTH - NOTIF_PAD * 2 - NOTIF_ICON - 10
@@ -240,6 +267,17 @@ showNextNotification = function()
 
   canvas:mouseCallback(function(c, message, id, _x, _y)
       if type(id) ~= "string" then return end
+
+      if id == "closeBtn" then
+          if message == "mouseEnter" then
+              pcall(function() c[id].fillColor = { white = 1, alpha = 0.18 } end)
+          elseif message == "mouseExit" then
+              pcall(function() c[id].fillColor = { white = 1, alpha = 0 } end)
+          elseif message == "mouseUp" then
+              dismissNotification()
+          end
+          return
+      end
 
       if message == "mouseEnter" then
           pcall(function() c[id].fillColor = { white = 1, alpha = 0.26 } end)
@@ -305,7 +343,7 @@ local function notifyComplete(filePath, audioOnly)
       message = name or "",
       duration = 8,
       buttons = {
-          { label = "Open",      fn = function() if filePath then hs.execute('open -R "' .. filePath .. '"') end end },
+          { label = "Show in finder",      fn = function() if filePath then hs.execute('open -R "' .. filePath .. '"') end end },
           { label = "Open File", fn = function() if filePath then hs.execute('open "' .. filePath .. '"') end end },
       },
   })
@@ -444,10 +482,8 @@ local function buildArgs(url, audioOnly)
       for _, v in ipairs(extra) do table.insert(args, v) end
   else
       local extra = {
-          "-f", "bestvideo[vcodec^=avc1]+bestaudio[ext=m4a]/bestvideo+bestaudio",
+          "-f", "bestvideo[vcodec^=avc1]+bestaudio[ext=m4a]/bestvideo[vcodec^=avc1]+bestaudio/bestvideo+bestaudio/best",
           "--merge-output-format", "mp4",
-          "--postprocessor-args",
-              "ffmpeg:-c:v libx264 -crf 23 -preset fast -c:a copy",
       }
       for _, v in ipairs(extra) do table.insert(args, v) end
   end
