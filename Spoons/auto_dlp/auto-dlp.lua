@@ -3,22 +3,34 @@
 -- ── Paths ──
 local HOME         = os.getenv("HOME")
 local DOWNLOAD_DIR = HOME .. "/Downloads/Auto-dlp"
+local WORK_ROOT    = DOWNLOAD_DIR .. "/.work"   -- per-download scratch dirs (hidden in Finder)
 local HISTORY_FILE = HOME .. "/Library/Application Support/Hammerspoon/video_history.txt"
 local YTDLP        = "/opt/homebrew/bin/yt-dlp"
 local NODE         = "/opt/homebrew/bin/node"
 local FFMPEG_DIR   = "/opt/homebrew/bin"
+local FFMPEG       = FFMPEG_DIR .. "/ffmpeg"
+local FFPROBE      = FFMPEG_DIR .. "/ffprobe"
+local OPEN         = "/usr/bin/open"
 
 -- ── Config ──
 local COUNTDOWN_SECONDS  = 5
 local MAX_HISTORY        = 500
-local DOWNLOAD_TIMEOUT   = 600   
-local MAX_CONCURRENT     = 2   
-local CONCURRENT_FRAGS   = 4   
+local INACTIVITY_TIMEOUT = 180   -- seconds with NO yt-dlp output before a download is treated as stalled
+local MAX_CONCURRENT     = 2
+local CONCURRENT_FRAGS   = 4
 local COOKIE_BROWSER     = "chrome" -- Change to: "safari", "firefox", "edge", "brave", etc.
+
+-- H.264 conversion
+local TRANSCODE_TO_H264  = true   -- convert non-H.264 video after download
+local PREFER_SOURCE_H264 = true   -- true: take H.264 (usually <=1080p on YouTube) over 4K VP9, no conversion
+                                  -- false: take best quality, then convert when needed
+local USE_HW_ENCODER     = true   -- h264_videotoolbox (fast) vs libx264 (smaller / better quality)
+local VT_QUALITY        = 65      -- videotoolbox -q:v (1-100, higher = better)
+local X264_CRF           = 20     -- libx264 quality (lower = better / larger)
 
 -- ── State ──
 local menubar          = nil
-local queue            = {}    
+local queue            = {}
 local history          = {}
 local pendingBatch     = nil
 local pendingBatchMode = nil    -- mode the pending batch was detected under ("video" / "audio"), locked at detection time
@@ -49,17 +61,37 @@ local MODE_MESSAGES = {
 
 local lastMenu = {}   -- most recently built menu table, shown on right-click via popupMenu
 
+-- activeSlots[key] = slot table. key = "video|<url>" or "audio|<url>", so the same
+-- URL can be fetched as both video and audio. Each slot carries its own `cancelled`
+-- flag, so late callbacks from a killed task can never touch a newer slot.
 local activeSlots = {}
-local terminating = {}   -- slotId -> true when we intentionally stop a task (suppress "failed")
+local slotCounter = 0
 local clipboardWatcher = nil
 local rightClickWatcher = nil
+local cleanupTimer = nil
 
--- Forward declaration (assigned further down).
-local cancelSlot
+-- Forward declarations (assigned further down).
+local cancelSlot, processQueue, updateMenu
 
 local dialogWebview    = nil   -- the manual "Download from URL" webview, when open
 local dialogController = nil   -- its hs.webview.usercontent controller; must stay
                                -- referenced or GC drops the message callback
+
+-- ── Small helpers ──
+local function makeKey(url, audioOnly)
+  return (audioOnly and "audio|" or "video|") .. url
+end
+
+local function shorten(s, n)
+  s = tostring(s or "")
+  if #s <= n then return s end
+  return s:sub(1, n - 1) .. "…"
+end
+
+-- Launch /usr/bin/open without a shell, so paths never need quoting.
+local function openPath(...)
+  hs.task.new(OPEN, function() end, { ... }):start()
+end
 
 -- ── Custom notifications ──
 -- Aural-style canvas panels shown under the menubar icon. Unlike hs.notify,
@@ -324,37 +356,53 @@ local function notify(spec)
 end
 
 local function notifyDownloadStarted(url, audioOnly)
+  local key = makeKey(url, audioOnly)
   notify({
       icon  = audioOnly and ICONS.audio or ICONS.video,
       title = "Download Started",
       message = (audioOnly and "Audio" or "Video") .. " • " .. url,
       duration = 8,
       buttons = {
-          { label = "Cancel", fn = function() cancelSlot(url) end },
+          { label = "Cancel", fn = function() cancelSlot(key) end },
       },
   })
 end
 
 local function notifyComplete(filePath, audioOnly)
-  local name = filePath and filePath:match("([^/]+)$") or (audioOnly and "Audio" or "Video")
-  notify({
-      icon  = "✅",
-      title = "Download Complete",
-      message = name or "",
-      duration = 8,
-      buttons = {
-          { label = "Show in finder",      fn = function() if filePath then hs.execute('open -R "' .. filePath .. '"') end end },
-          { label = "Open File", fn = function() if filePath then hs.execute('open "' .. filePath .. '"') end end },
-      },
-  })
+  if filePath and hs.fs.attributes(filePath) then
+      local name = filePath:match("([^/]+)$") or (audioOnly and "Audio" or "Video")
+      notify({
+          icon  = "✅",
+          title = "Download Complete",
+          message = name,
+          duration = 8,
+          buttons = {
+              { label = "Show in Finder", fn = function() openPath("-R", filePath) end },
+              { label = "Open",           fn = function() openPath(filePath) end },
+          },
+      })
+  else
+      -- yt-dlp didn't report a usable path (or the file moved): don't point at a guess.
+      notify({
+          icon  = "✅",
+          title = "Download Complete",
+          message = "Saved to the Auto-dlp folder",
+          duration = 8,
+          buttons = {
+              { label = "Open Folder", fn = function() openPath(DOWNLOAD_DIR) end },
+          },
+      })
+  end
 end
 
-local function notifyFailed(url, audioOnly)
+local function notifyFailed(url, audioOnly, reason)
+  local msg = shorten(url, 48)
+  if reason and reason ~= "" then msg = shorten(reason, 90) .. "\n" .. msg end
   notify({
       icon  = "❌",
       title = "Download Failed",
-      message = url,
-      duration = 8,
+      message = msg,
+      duration = 12,
       buttons = {
           { label = "Retry", fn = function()
               table.insert(queue, { url = url, audioOnly = audioOnly })
@@ -378,9 +426,12 @@ local function checkDependencies()
       table.insert(missing, "node (" .. NODE .. ")")
   end
 
-  local ffmpeg_exists = hs.fs.attributes(FFMPEG_DIR .. "/ffmpeg")
-  if not ffmpeg_exists then
-      table.insert(missing, "ffmpeg (" .. FFMPEG_DIR .. "/ffmpeg)")
+  if not hs.fs.attributes(FFMPEG) then
+      table.insert(missing, "ffmpeg (" .. FFMPEG .. ")")
+  end
+
+  if not hs.fs.attributes(FFPROBE) then
+      table.insert(missing, "ffprobe (" .. FFPROBE .. ")")
   end
 
   if #missing > 0 then
@@ -418,6 +469,9 @@ local ALLOWED_DOMAINS = {
 
 os.execute('mkdir -p "' .. DOWNLOAD_DIR .. '"')
 os.execute('mkdir -p "' .. HOME .. '/Library/Application Support/Hammerspoon"')
+-- Nothing can be mid-download at load time, so any leftover scratch dirs are stale.
+os.execute('rm -rf "' .. WORK_ROOT .. '"')
+os.execute('mkdir -p "' .. WORK_ROOT .. '"')
 
 local function activeCount()
   local n = 0
@@ -426,6 +480,8 @@ local function activeCount()
 end
 
 -- ── History ──
+-- Entries are keyed "video|<url>" / "audio|<url>". Older history files stored the
+-- bare URL; those are treated as video downloads when loaded.
 local function loadHistory()
   local file = io.open(HISTORY_FILE, "r")
   if not file then return end
@@ -435,7 +491,14 @@ local function loadHistory()
   file:close()
 
   local start = math.max(1, #lines - MAX_HISTORY + 1)
-  for i = start, #lines do history[lines[i]] = true end
+  for i = start, #lines do
+      local line = lines[i]
+      if line:match("^video|") or line:match("^audio|") then
+          history[line] = true
+      elseif line ~= "" then
+          history["video|" .. line] = true
+      end
+  end
 
   if #lines > MAX_HISTORY then
       local out = io.open(HISTORY_FILE, "w")
@@ -446,30 +509,41 @@ local function loadHistory()
   end
 end
 
-local function saveHistory(url)
+local function saveHistory(key)
   local file = io.open(HISTORY_FILE, "a")
-  if file then file:write(url .. "\n"); file:close() end
-  history[url] = true
+  if file then file:write(key .. "\n"); file:close() end
+  history[key] = true
 end
 
 -- ── Cleanup ──
 local function cleanupTempFiles()
   os.execute('find "' .. DOWNLOAD_DIR
-      .. '" \\( -name "*.part" -o -name "*.ytdl" \\) -mtime +1 -delete')
+      .. '" \\( -name "*.part" -o -name "*.ytdl" -o -name "*.h264tmp.mp4" \\) -mtime +1 -delete')
+  os.execute('find "' .. WORK_ROOT
+      .. '" -mindepth 1 -maxdepth 1 -type d -mtime +1 -exec rm -rf {} +')
 end
 
 -- ── yt-dlp args builder ──
-local function buildArgs(url, audioOnly)
-  local outTemplate = DOWNLOAD_DIR .. "/%(title)s.%(ext)s"
+-- Output protocol (parsed in the stream callback):
+--   DLPPROG <percent> <speed>   progress lines (also act as the inactivity heartbeat)
+--   DLPFILE:<path>              final file path, printed once after the move
+-- Files are written into a private per-download work dir and only moved into
+-- DOWNLOAD_DIR once fully finished (including any H.264 conversion). Name pattern is
+-- <title>_<id, max 15 chars>.<ext>, so two posts by one account never share a name.
+local function buildArgs(url, audioOnly, outDir)
+  local outTemplate = outDir .. "/%(title)s_%(id).15s.%(ext)s"
   local args = {
-      "--js-runtimes",         "node:" .. NODE,
-      "--ffmpeg-location",     FFMPEG_DIR,
+      "--js-runtimes",          "node:" .. NODE,
+      "--ffmpeg-location",      FFMPEG_DIR,
       "--restrict-filenames",
       "--no-playlist",
       "--concurrent-fragments", tostring(CONCURRENT_FRAGS),
       "--cookies-from-browser", COOKIE_BROWSER,
-      "--print",               "after_move:filepath",
-      "-o",                    outTemplate,
+      "--embed-metadata",
+      "--progress", "--newline",
+      "--progress-template",    "download:DLPPROG %(progress._percent_str)s %(progress._speed_str)s",
+      "--print",                "after_move:DLPFILE:%(filepath)s",
+      "-o",                     outTemplate,
   }
 
   if audioOnly then
@@ -478,12 +552,18 @@ local function buildArgs(url, audioOnly)
           "--extract-audio",
           "--audio-format", "mp3",
           "--audio-quality", "0",
+          "--embed-thumbnail",
+          "--convert-thumbnails", "jpg",
       }
       for _, v in ipairs(extra) do table.insert(args, v) end
   else
+      local fmt = PREFER_SOURCE_H264
+          and "bv*[vcodec^=avc1]+ba[ext=m4a]/bv*[vcodec^=avc1]+ba/bv*+ba/b"
+          or  "bv*+ba/b"
       local extra = {
-          "-f", "bestvideo[vcodec^=avc1]+bestaudio[ext=m4a]/bestvideo[vcodec^=avc1]+bestaudio/bestvideo+bestaudio/best",
+          "-f", fmt,
           "--merge-output-format", "mp4",
+          "--embed-chapters",
       }
       for _, v in ipairs(extra) do table.insert(args, v) end
   end
@@ -493,12 +573,281 @@ local function buildArgs(url, audioOnly)
 end
 
 -- ── Domain allow-list ──
+-- Matches on the URL's host (exact or subdomain), not on a substring of the whole URL.
 local function isAllowed(url)
-  local lower = url:lower()
-  for _, domain in ipairs(ALLOWED_DOMAINS) do
-      if lower:find(domain, 1, true) then return true end
+  local host = url:lower():match("^https?://([^/%?#:]+)")
+  if not host then return false end
+  for _, d in ipairs(ALLOWED_DOMAINS) do
+      if host == d or host:sub(-(#d + 1)) == "." .. d then return true end
   end
   return false
+end
+
+-- ── Work dir / final-name helpers ──
+local pendingCleanups = {}   -- keeps delayed-cleanup timers referenced until they fire
+
+local function cleanupWork(slot)
+  local dir = slot.workDir
+  slot.workDir = nil
+  -- Only ever delete inside our own scratch root.
+  if dir and dir:sub(1, #WORK_ROOT + 1) == WORK_ROOT .. "/" then
+      hs.task.new("/bin/rm", function() end, { "-rf", dir }):start()
+  end
+end
+
+-- Used after kill/cancel: give the killed process a moment to exit before deleting its dir.
+local function scheduleWorkCleanup(slot, delay)
+  local t
+  t = hs.timer.doAfter(delay, function()
+      pendingCleanups[t] = nil
+      cleanupWork(slot)
+  end)
+  pendingCleanups[t] = true
+end
+
+-- Largest regular file in the work dir that isn't a known temp artifact.
+-- Only a fallback for when yt-dlp doesn't report DLPFILE.
+local function findOutputFile(dir)
+  if not dir then return nil end
+  local best, bestSize = nil, -1
+  local ok, iter, state = pcall(hs.fs.dir, dir)
+  if not ok or not iter then return nil end
+  for name in iter, state do
+      if name:sub(1, 1) ~= "."
+          and not name:match("%.part$") and not name:match("%.ytdl$")
+          and not name:match("%.h264tmp%.mp4$") then
+          local attr = hs.fs.attributes(dir .. "/" .. name)
+          if attr and attr.mode == "file" and attr.size > bestSize then
+              best, bestSize = dir .. "/" .. name, attr.size
+          end
+      end
+  end
+  return best
+end
+
+-- First free name in DOWNLOAD_DIR: name.ext, then name_01.ext, name_02.ext, ...
+local function uniqueDest(name)
+  local base, ext = name:match("^(.*)(%.[^./]+)$")
+  if not base then base, ext = name, "" end
+
+  local dest = DOWNLOAD_DIR .. "/" .. name
+  local n = 0
+  while hs.fs.attributes(dest) do
+      n = n + 1
+      if n > 999 then
+          dest = string.format("%s/%s_%d%s", DOWNLOAD_DIR, base, os.time(), ext)
+          break
+      end
+      dest = string.format("%s/%s_%02d%s", DOWNLOAD_DIR, base, n, ext)
+  end
+  return dest
+end
+
+-- Move a finished file out of its work dir into DOWNLOAD_DIR without ever overwriting.
+-- The check and the rename run back-to-back on the main thread, so two downloads
+-- finishing together can't pick the same name.
+local function moveToFinal(path)
+  local name = path:match("([^/]+)$")
+  if not name then return nil, "bad path" end
+  local dest = uniqueDest(name)
+  local ok, err = os.rename(path, dest)
+  if not ok then return nil, err end
+  return dest
+end
+
+-- ── Slot helpers ──
+-- Stop a slot's current process + watchdog and release its key. Callers decide
+-- whether to notify / advance the queue.
+local function killSlot(slot)
+  slot.cancelled = true
+  scheduleWorkCleanup(slot, 2)
+  if slot.watchdog then slot.watchdog:stop(); slot.watchdog = nil end
+  if slot.task then pcall(function() slot.task:terminate() end) end
+  if activeSlots[slot.key] == slot then activeSlots[slot.key] = nil end
+end
+
+-- Inactivity watchdog: re-armed whenever yt-dlp produces output, so slow-but-moving
+-- downloads are never killed; only ones that go silent for INACTIVITY_TIMEOUT seconds.
+local function onStall(slot)
+  if slot.cancelled then return end
+  killSlot(slot)
+  notifyFailed(slot.url, slot.audioOnly, "Stalled: no activity for " .. INACTIVITY_TIMEOUT .. "s")
+  processQueue()
+end
+
+local function armWatchdog(slot)
+  if slot.watchdog then slot.watchdog:stop() end
+  slot.lastArm  = hs.timer.secondsSinceEpoch()
+  slot.watchdog = hs.timer.doAfter(INACTIVITY_TIMEOUT, function() onStall(slot) end)
+end
+
+-- ── Output parsing ──
+local function consumeLine(slot, line)
+  line = line:match("^%s*(.-)%s*$")
+  if line == "" then return end
+
+  local prog = line:match("^DLPPROG%s+(.+)$")
+  if prog then
+      slot.progress = (prog:gsub("%s+", " "))
+      return
+  end
+
+  local fp = line:match("^DLPFILE:(.+)$")
+  if fp then slot.filePath = fp; return end
+
+  table.insert(slot.log, line)
+  if #slot.log > 200 then table.remove(slot.log, 1) end
+
+  local err = line:match("^ERROR:%s*(.+)$")
+  if err then slot.lastError = err end
+end
+
+local function makeStreamCallback(slot)
+  return function(_, out, err)
+      for which, data in pairs({ out = out, err = err }) do
+          if data and data ~= "" then
+              local rest = slot.partial[which] .. (data:gsub("\r", "\n"))
+              while true do
+                  local nl = rest:find("\n", 1, true)
+                  if not nl then break end
+                  consumeLine(slot, rest:sub(1, nl - 1))
+                  rest = rest:sub(nl + 1)
+              end
+              slot.partial[which] = rest
+          end
+      end
+
+      -- Heartbeat (throttled so we don't churn timers on every progress line).
+      if not slot.cancelled and slot.watchdog
+          and hs.timer.secondsSinceEpoch() - (slot.lastArm or 0) > 2 then
+          armWatchdog(slot)
+      end
+      return true
+  end
+end
+
+-- Turn the last yt-dlp "ERROR:" line into something short enough for a notification.
+local function cleanError(raw)
+  if not raw or raw == "" then return nil end
+  local msg = raw
+  msg = msg:gsub("^%[[^%]]+%]%s+[^%s:]+:%s*", "")   -- "[youtube] ID: " prefix
+  msg = msg:gsub("%s*;%s*please report.*$", "")
+  msg = msg:gsub("%s*Confirm you are on the latest version.*$", "")
+  msg = msg:gsub("%s+", " ")
+  return shorten(msg, 110)
+end
+
+-- ── H.264 conversion ──
+local function probeStreams(path, cb)
+  hs.task.new(FFPROBE, function(code, out)
+      local info = {}
+      if code == 0 then
+          local ok, data = pcall(hs.json.decode, out)
+          if ok and type(data) == "table" and type(data.streams) == "table" then
+              for _, s in ipairs(data.streams) do
+                  if s.codec_type == "video" and not info.video then
+                      info.video = s.codec_name
+                      info.pix   = s.pix_fmt
+                  elseif s.codec_type == "audio" and not info.audio then
+                      info.audio = s.codec_name
+                  end
+              end
+          end
+      end
+      cb(info)
+  end, {
+      "-v", "error",
+      "-show_entries", "stream=codec_name,codec_type,pix_fmt",
+      "-of", "json",
+      path,
+  }):start()
+end
+
+-- Re-encodes only what's needed: video is copied if it's already 8-bit H.264,
+-- audio is copied if it's already AAC. Keeps the original on any failure.
+local function ensureH264(slot, filePath, done)
+  probeStreams(filePath, function(info)
+      if slot.cancelled then return end
+
+      local v, a = info.video, info.audio
+      if not v then return done(filePath) end
+
+      local pixOk   = (info.pix == nil) or info.pix == "yuv420p" or info.pix == "yuvj420p"
+      local videoOk = (v == "h264") and pixOk
+      local audioOk = (a == nil) or (a == "aac")
+      if videoOk and audioOk then return done(filePath) end
+
+      local base  = filePath:gsub("%.[^./]+$", "")
+      local final = base .. ".mp4"
+      local tmp   = base .. ".h264tmp.mp4"
+
+      slot.stage = "convert"
+      updateMenu()
+
+      local function encode(useHW)
+          local args = { "-y", "-v", "error", "-i", filePath,
+                         "-map", "0:v:0", "-map", "0:a?",
+                         "-map_metadata", "0", "-map_chapters", "0" }
+
+          if videoOk then
+              for _, x in ipairs({ "-c:v", "copy" }) do table.insert(args, x) end
+          elseif useHW then
+              for _, x in ipairs({ "-c:v", "h264_videotoolbox", "-q:v", tostring(VT_QUALITY),
+                                   "-pix_fmt", "yuv420p", "-tag:v", "avc1" }) do table.insert(args, x) end
+          else
+              for _, x in ipairs({ "-c:v", "libx264", "-crf", tostring(X264_CRF), "-preset", "fast",
+                                   "-pix_fmt", "yuv420p" }) do table.insert(args, x) end
+          end
+
+          if audioOk then
+              for _, x in ipairs({ "-c:a", "copy" }) do table.insert(args, x) end
+          else
+              for _, x in ipairs({ "-c:a", "aac", "-b:a", "192k" }) do table.insert(args, x) end
+          end
+
+          for _, x in ipairs({ "-movflags", "+faststart", tmp }) do table.insert(args, x) end
+
+          if not (not videoOk and not useHW and USE_HW_ENCODER) then
+              -- (skip the toast on the software retry after a hardware failure)
+              notify({
+                  icon = "🔄", title = "Converting",
+                  message = v .. (a and ("/" .. a) or "") .. " → h264/aac",
+                  duration = 4,
+              })
+          end
+
+          local task = hs.task.new(FFMPEG, function(code, _, stderr)
+              if slot.cancelled then
+                  os.remove(tmp)
+                  return
+              end
+
+              if code == 0 then
+                  os.rename(tmp, final)
+                  if final ~= filePath then os.remove(filePath) end
+                  return done(final)
+              end
+
+              os.remove(tmp)
+              if not videoOk and useHW then
+                  print("Auto-dlp: videotoolbox failed, retrying with libx264")
+                  if stderr and stderr ~= "" then print(stderr) end
+                  return encode(false)
+              end
+
+              if stderr and stderr ~= "" then print(stderr) end
+              notify({ icon = "⚠", title = "Conversion Failed",
+                       message = "Kept original (" .. v .. ")", duration = 5 })
+              done(filePath)
+          end, args)
+
+          -- Register on the slot so Cancel / Stop All kill ffmpeg too.
+          slot.task = task
+          task:start()
+      end
+
+      encode((not videoOk) and USE_HW_ENCODER)
+  end)
 end
 
 -- ── Pending batch / cancellation helpers ──
@@ -526,22 +875,19 @@ local function cancelPending()
   updateMenu()
 end
 
-cancelSlot = function(slotId)
-  local slot = activeSlots[slotId]
+cancelSlot = function(key)
+  local slot = activeSlots[key]
   if not slot then return end
 
-  terminating[slotId] = true
-  if slot.watchdog then slot.watchdog:stop() end
-  if slot.task    then slot.task:terminate() end
-  activeSlots[slotId] = nil
-
+  killSlot(slot)
   updateMenu()
   notify({
       icon  = "⛔",
       title = "Download Cancelled",
-      message = slotId,
+      message = slot.url,
       duration = 3,
   })
+  processQueue()
 end
 
 local function cancelAll()
@@ -551,14 +897,9 @@ local function cancelAll()
   pendingDeadline  = nil
   queue            = {}
 
-  for slotId, slot in pairs(activeSlots) do
-      if slot then
-          terminating[slotId] = true
-          if slot.watchdog then slot.watchdog:stop() end
-          if slot.task    then slot.task:terminate() end
-          activeSlots[slotId] = nil
-      end
-  end
+  local slots = {}
+  for _, slot in pairs(activeSlots) do table.insert(slots, slot) end
+  for _, slot in ipairs(slots) do killSlot(slot) end
 
   -- Drop anything already queued and replace it with a single confirmation.
   notifyQueue = {}
@@ -781,7 +1122,7 @@ local function setMode(newMode)
 end
 
 -- ── Menu ──
-function updateMenu()
+updateMenu = function()
   local ac = activeCount()
   -- Sum total active downloads, queued downloads, and pending batch items
   local total = #queue + (pendingBatch and #pendingBatch or 0) + ac
@@ -806,6 +1147,21 @@ function updateMenu()
           fn = function() cancelPending() end
       })
 
+      table.insert(menu, { title = "-" })
+  end
+
+  -- Live status lines for active downloads (refreshed each time the menu is opened).
+  local active = {}
+  for _, s in pairs(activeSlots) do table.insert(active, s) end
+  table.sort(active, function(a, b) return a.seq < b.seq end)
+  if #active > 0 then
+      for _, s in ipairs(active) do
+          local status = (s.stage == "convert") and "Converting…" or (s.progress or "Starting…")
+          table.insert(menu, {
+              title = (s.audioOnly and "♪ " or "▶ ") .. status .. "  " .. shorten(s.url, 40),
+              disabled = true,
+          })
+      end
       table.insert(menu, { title = "-" })
   end
 
@@ -838,90 +1194,140 @@ function updateMenu()
 
   table.insert(menu, {
       title = "Open Download Folder",
-      fn = function() hs.execute('open "' .. DOWNLOAD_DIR .. '"') end
+      fn = function() openPath(DOWNLOAD_DIR) end
   })
 
   lastMenu = menu
 end
 
 -- ── Parallel download engine ──
-function processQueue()
+-- yt-dlp exit handler. Runs once per slot; cancelled slots were already cleaned up
+-- by whoever cancelled them, so they only get a menu refresh here.
+local function onYtdlpExit(slot, exitCode)
+  if slot.watchdog then slot.watchdog:stop(); slot.watchdog = nil end
+
+  -- Flush any final line that arrived without a trailing newline.
+  for _, which in ipairs({ "out", "err" }) do
+      if slot.partial[which] ~= "" then
+          consumeLine(slot, slot.partial[which])
+          slot.partial[which] = ""
+      end
+  end
+
+  if slot.cancelled then
+      updateMenu()
+      return
+  end
+
+  print("================================")
+  print("URL:",  slot.url)
+  print("Mode:", slot.audioOnly and "Audio" or "Video")
+  print("Exit:", exitCode)
+  for _, line in ipairs(slot.log) do print(line) end
+  if slot.filePath then print("File:", slot.filePath) end
+  print("================================")
+
+  local function release()
+      if activeSlots[slot.key] == slot then activeSlots[slot.key] = nil end
+  end
+
+  if exitCode ~= 0 then
+      release()
+      cleanupWork(slot)
+      notifyFailed(slot.url, slot.audioOnly, cleanError(slot.lastError))
+      processQueue()
+      return
+  end
+
+  local filePath = slot.filePath
+  if not (filePath and hs.fs.attributes(filePath)) then
+      filePath = findOutputFile(slot.workDir)
+  end
+
+  if not filePath then
+      release()
+      cleanupWork(slot)
+      notifyFailed(slot.url, slot.audioOnly, "yt-dlp finished but produced no file")
+      processQueue()
+      return
+  end
+
+  -- Last step for every path (converted, unconverted, audio): move into DOWNLOAD_DIR
+  -- under a name that doesn't exist yet. History is only written once the file is there.
+  local function finish(path)
+      if slot.cancelled then return end
+
+      local dest, err = moveToFinal(path)
+      release()
+
+      if dest then
+          saveHistory(slot.key)
+          cleanupWork(slot)
+          notifyComplete(dest, slot.audioOnly)
+      else
+          print("Auto-dlp: could not move " .. path .. " (" .. tostring(err) .. ")")
+          notify({
+              icon  = "⚠",
+              title = "Couldn't Move File",
+              message = "Left in the hidden .work folder",
+              duration = 10,
+              buttons = {
+                  { label = "Show in Finder", fn = function() openPath("-R", path) end },
+              },
+          })
+      end
+      processQueue()
+  end
+
+  if slot.audioOnly or not TRANSCODE_TO_H264 then
+      finish(filePath)
+  else
+      ensureH264(slot, filePath, finish)
+  end
+end
+
+processQueue = function()
   updateMenu()
 
   while activeCount() < MAX_CONCURRENT and #queue > 0 do
-      local item           = table.remove(queue, 1)
-      local url            = item.url
-      local downloadAudioOnly = item.audioOnly
+      local item = table.remove(queue, 1)
+      local key  = makeKey(item.url, item.audioOnly)
 
-      local slotId = url
+      if not activeSlots[key] then
+          slotCounter = slotCounter + 1
+          local slot = {
+              key       = key,
+              url       = item.url,
+              audioOnly = item.audioOnly,
+              seq       = slotCounter,
+              stage     = "download",
+              partial   = { out = "", err = "" },
+              log       = {},
+              workDir   = string.format("%s/%d-%d", WORK_ROOT, os.time(), slotCounter),
+          }
+          os.execute('mkdir -p "' .. slot.workDir .. '"')
+          activeSlots[key] = slot
 
-      notifyDownloadStarted(url, downloadAudioOnly)
+          notifyDownloadStarted(item.url, item.audioOnly)
+          armWatchdog(slot)
 
-      local args = buildArgs(url, downloadAudioOnly)
+          local task = hs.task.new(
+              YTDLP,
+              function(exitCode) onYtdlpExit(slot, exitCode) end,
+              makeStreamCallback(slot),
+              buildArgs(item.url, item.audioOnly, slot.workDir)
+          )
 
-      local watchdog = hs.timer.doAfter(DOWNLOAD_TIMEOUT, function()
-          local slot = activeSlots[slotId]
-          if slot and slot.task then
-              terminating[slotId] = true
-              if slot.watchdog then slot.watchdog:stop() end
-              slot.task:terminate()
-              activeSlots[slotId] = nil
-              notify({
-                  icon  = "⏱",
-                  title = "Download Timed Out",
-                  message = url,
-                  duration = 3,
-              })
-              processQueue()
+          if task then
+              slot.task = task
+              task:start()
+          else
+              killSlot(slot)
+              notifyFailed(item.url, item.audioOnly, "Could not launch yt-dlp")
           end
-      end)
 
-      local task = hs.task.new(
-          YTDLP,
-          function(exitCode, stdout, stderr)
-              -- A cancel/timeout already cleaned this slot up; don't double-report.
-              if terminating[slotId] then
-                  terminating[slotId] = nil
-                  updateMenu()
-                  processQueue()
-                  return
-              end
-
-              local slot = activeSlots[slotId]
-              if slot and slot.watchdog then slot.watchdog:stop() end
-              activeSlots[slotId] = nil
-
-              print("================================")
-              print("URL:",  url)
-              print("Mode:", downloadAudioOnly and "Audio" or "Video")
-              print("Exit:", exitCode)
-              if stdout and stdout ~= "" then print(stdout) end
-              if stderr and stderr ~= "" then print(stderr) end
-              print("================================")
-
-              if exitCode == 0 then
-                  saveHistory(url)
-
-                  local filePath = nil
-                  for line in (stdout or ""):gmatch("[^\n]+") do
-                      local trimmed = line:match("^%s*(.-)%s*$")
-                      if trimmed ~= "" then filePath = trimmed end
-                  end
-                  filePath = filePath
-                      or (DOWNLOAD_DIR .. "/" .. (downloadAudioOnly and "audio.mp3" or "video.mp4"))
-
-                  notifyComplete(filePath, downloadAudioOnly)
-              else
-                  notifyFailed(url, downloadAudioOnly)
-              end
-
-              processQueue()
-          end,
-          args
-      ):start()
-
-      activeSlots[slotId] = { task = task, watchdog = watchdog }
-      updateMenu()
+          updateMenu()
+      end
   end
 end
 
@@ -939,31 +1345,41 @@ function hs.auto_dlp_unload()
        pendingTimer:stop()
        pendingTimer = nil
    end
+   if cleanupTimer then
+       cleanupTimer:stop()
+       cleanupTimer = nil
+   end
+   closeURLDialog()
    stopNotifTimers()
    if notifCanvas then
        pcall(function() notifCanvas:delete() end)
        notifCanvas = nil
    end
-   for slotId, slot in pairs(activeSlots) do
-       if slot then
-           if slot.watchdog then slot.watchdog:stop() end
-           if slot.task    then slot.task:terminate() end
-           activeSlots[slotId] = nil
-       end
-   end
+   local slots = {}
+   for _, slot in pairs(activeSlots) do table.insert(slots, slot) end
+   for _, slot in ipairs(slots) do killSlot(slot) end
    if menubar then
        menubar:delete()
        menubar = nil
    end
 end
 
--- Ensure we clean up if Hammerspoon is quitting
-hs.shutdownCallback = hs.auto_dlp_unload
+-- Chain onto hs.shutdownCallback instead of overwriting it, so other scripts
+-- (aural.lua etc.) keep their own handlers. The guard stops wrappers stacking
+-- when this file is reloaded without restarting Hammerspoon.
+if not hs._autoDlpShutdownHooked then
+  hs._autoDlpShutdownHooked = true
+  local prev = hs.shutdownCallback
+  hs.shutdownCallback = function()
+      if hs.auto_dlp_unload then hs.auto_dlp_unload() end
+      if prev then prev() end
+  end
+end
 
 -- ── INITIALIZATION ──
 loadHistory()
 cleanupTempFiles()
-hs.timer.doEvery(86400, cleanupTempFiles)
+cleanupTimer = hs.timer.doEvery(86400, cleanupTempFiles)
 
 clipboardWatcher = hs.pasteboard.watcher.new(function()
   if mode == "idle" then return end   -- Idle = monitoring off
@@ -971,21 +1387,23 @@ clipboardWatcher = hs.pasteboard.watcher.new(function()
   local clipboard = hs.pasteboard.getContents()
   if not clipboard or #clipboard < 10 then return end
 
+  local audioMode = (mode == "audio")
   local urls = {}
   local seen = {}
 
   for url in clipboard:gmatch("https?://[%w%-%._~:/%?#%[%]@!$&%'%(%)%*%+,;=]+") do
       local clean = url:gsub("[%.,%?!;]+$", "")
+      local key   = makeKey(clean, audioMode)
 
       if isAllowed(clean)
-          and not history[clean]
+          and not history[key]
           and not seen[clean]
       then
           local alreadyQueued = false
           for _, item in ipairs(queue) do
-              if item.url == clean then alreadyQueued = true; break end
+              if item.url == clean and item.audioOnly == audioMode then alreadyQueued = true; break end
           end
-          if not alreadyQueued and not activeSlots[clean] then
+          if not alreadyQueued and not activeSlots[key] then
               seen[clean] = true
               table.insert(urls, clean)
           end
@@ -1057,6 +1475,7 @@ rightClickWatcher = hs.eventtap.new(
   { hs.eventtap.event.types.rightMouseUp },
   function(event)
       if isMouseOverMenubar() and menubar then
+          updateMenu()   -- refresh live progress lines before showing
           menubar:setMenu(lastMenu)
           menubar:popupMenu(hs.mouse.absolutePosition())
           -- Detach again so a subsequent LEFT click falls through to
