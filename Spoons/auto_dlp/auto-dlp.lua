@@ -20,6 +20,11 @@ local MAX_CONCURRENT     = 2
 local CONCURRENT_FRAGS   = 4
 local COOKIE_BROWSER     = "chrome" -- Change to: "safari", "firefox", "edge", "brave", etc.
 
+-- Cookies: every download first runs WITHOUT cookies. Only if that attempt fails
+-- is it retried once with --cookies-from-browser.
+local REMEMBER_COOKIE_HOSTS = true  -- once a site needed cookies, start its later downloads with them
+                                    -- (until Hammerspoon reloads). false = always try without first.
+
 -- H.264 conversion
 local TRANSCODE_TO_H264  = true   -- convert non-H.264 video after download
 local PREFER_SOURCE_H264 = true   -- true: take H.264 (usually <=1080p on YouTube) over 4K VP9, no conversion
@@ -32,6 +37,7 @@ local X264_CRF           = 20     -- libx264 quality (lower = better / larger)
 local menubar          = nil
 local queue            = {}
 local history          = {}
+local cookieHosts      = {}     -- domain -> true, for sites that needed cookies this session
 local pendingBatch     = nil
 local pendingBatchMode = nil    -- mode the pending batch was detected under ("video" / "audio"), locked at detection time
 local pendingDeadline  = nil    -- absolute time (hs.timer.secondsSinceEpoch) the countdown ends
@@ -71,7 +77,7 @@ local rightClickWatcher = nil
 local cleanupTimer = nil
 
 -- Forward declarations (assigned further down).
-local cancelSlot, processQueue, updateMenu
+local cancelSlot, processQueue, updateMenu, launchYtdlp
 
 local dialogWebview    = nil   -- the manual "Download from URL" webview, when open
 local dialogController = nil   -- its hs.webview.usercontent controller; must stay
@@ -530,7 +536,8 @@ end
 -- Files are written into a private per-download work dir and only moved into
 -- DOWNLOAD_DIR once fully finished (including any H.264 conversion). Name pattern is
 -- <title>_<id, max 15 chars>.<ext>, so two posts by one account never share a name.
-local function buildArgs(url, audioOnly, outDir)
+-- Cookies are only passed when useCookies is true (the retry attempt).
+local function buildArgs(url, audioOnly, outDir, useCookies)
   local outTemplate = outDir .. "/%(title)s_%(id).15s.%(ext)s"
   local args = {
       "--js-runtimes",          "node:" .. NODE,
@@ -538,13 +545,17 @@ local function buildArgs(url, audioOnly, outDir)
       "--restrict-filenames",
       "--no-playlist",
       "--concurrent-fragments", tostring(CONCURRENT_FRAGS),
-      "--cookies-from-browser", COOKIE_BROWSER,
       "--embed-metadata",
       "--progress", "--newline",
       "--progress-template",    "download:DLPPROG %(progress._percent_str)s %(progress._speed_str)s",
       "--print",                "after_move:DLPFILE:%(filepath)s",
       "-o",                     outTemplate,
   }
+
+  if useCookies then
+      table.insert(args, "--cookies-from-browser")
+      table.insert(args, COOKIE_BROWSER)
+  end
 
   if audioOnly then
       local extra = {
@@ -581,6 +592,37 @@ local function isAllowed(url)
       if host == d or host:sub(-(#d + 1)) == "." .. d then return true end
   end
   return false
+end
+
+-- ── Cookie fallback helpers ──
+-- Site key used to remember which sites needed cookies: the matching allow-list
+-- domain (so www.instagram.com and instagram.com share one entry), else the host.
+local function domainKey(url)
+  local host = url:lower():match("^https?://([^/%?#:]+)")
+  if not host then return url end
+  for _, d in ipairs(ALLOWED_DOMAINS) do
+      if host == d or host:sub(-(#d + 1)) == "." .. d then return d end
+  end
+  return host
+end
+
+-- Errors that cookies can't possibly fix; retrying with them would just fail twice.
+local NO_COOKIE_RETRY = {
+  "unsupported url",
+  "getaddrinfo",
+  "network is unreachable",
+  "name or service not known",
+  "temporary failure in name resolution",
+  "no address associated",
+}
+
+local function shouldRetryWithCookies(err)
+  if not err or err == "" then return true end
+  local e = err:lower()
+  for _, p in ipairs(NO_COOKIE_RETRY) do
+      if e:find(p, 1, true) then return false end
+  end
+  return true
 end
 
 -- ── Work dir / final-name helpers ──
@@ -668,6 +710,7 @@ end
 
 -- Inactivity watchdog: re-armed whenever yt-dlp produces output, so slow-but-moving
 -- downloads are never killed; only ones that go silent for INACTIVITY_TIMEOUT seconds.
+-- Stalls are NOT retried with cookies: a silent download isn't an auth problem.
 local function onStall(slot)
   if slot.cancelled then return end
   killSlot(slot)
@@ -1201,7 +1244,7 @@ updateMenu = function()
 end
 
 -- ── Parallel download engine ──
--- yt-dlp exit handler. Runs once per slot; cancelled slots were already cleaned up
+-- yt-dlp exit handler. Runs once per attempt; cancelled slots were already cleaned up
 -- by whoever cancelled them, so they only get a menu refresh here.
 local function onYtdlpExit(slot, exitCode)
   if slot.watchdog then slot.watchdog:stop(); slot.watchdog = nil end
@@ -1222,6 +1265,7 @@ local function onYtdlpExit(slot, exitCode)
   print("================================")
   print("URL:",  slot.url)
   print("Mode:", slot.audioOnly and "Audio" or "Video")
+  print("Cookies:", slot.useCookies and COOKIE_BROWSER or "none")
   print("Exit:", exitCode)
   for _, line in ipairs(slot.log) do print(line) end
   if slot.filePath then print("File:", slot.filePath) end
@@ -1232,11 +1276,36 @@ local function onYtdlpExit(slot, exitCode)
   end
 
   if exitCode ~= 0 then
+      -- First attempt ran without cookies: retry once with them, unless the
+      -- error is clearly something cookies can't fix.
+      if not slot.useCookies and shouldRetryWithCookies(slot.lastError) then
+          slot.firstError = slot.lastError
+          slot.useCookies = true
+          print("Auto-dlp: failed without cookies, retrying with " .. COOKIE_BROWSER .. " cookies")
+          if launchYtdlp(slot) then
+              updateMenu()
+              return
+          end
+      end
+
       release()
       cleanupWork(slot)
-      notifyFailed(slot.url, slot.audioOnly, cleanError(slot.lastError))
+
+      -- If the cookie attempt died on cookie access itself (browser DB locked,
+      -- keychain denied...), the first attempt's error is the more useful one.
+      local reason = slot.lastError or slot.firstError
+      if slot.firstError and reason and reason:lower():find("cookie", 1, true) then
+          reason = slot.firstError
+      end
+      notifyFailed(slot.url, slot.audioOnly, cleanError(reason))
       processQueue()
       return
+  end
+
+  -- Succeeded only after the cookie retry: this site needs cookies, so skip the
+  -- doomed first attempt on its later downloads.
+  if REMEMBER_COOKIE_HOSTS and slot.useCookies and not slot.startedWithCookies then
+      cookieHosts[domainKey(slot.url)] = true
   end
 
   local filePath = slot.filePath
@@ -1286,6 +1355,35 @@ local function onYtdlpExit(slot, exitCode)
   end
 end
 
+-- Starts (or restarts) yt-dlp for a slot. Resets per-attempt state so the retry's
+-- output and errors don't mix with the first attempt's. Partial files in the work
+-- dir are kept, so yt-dlp can resume them on the cookie attempt.
+launchYtdlp = function(slot)
+  slot.partial   = { out = "", err = "" }
+  slot.log       = {}
+  slot.lastError = nil
+  slot.filePath  = nil
+  slot.stage     = "download"
+  slot.progress  = slot.useCookies and "Retrying with cookies…" or nil
+  armWatchdog(slot)
+
+  local task = hs.task.new(
+      YTDLP,
+      function(exitCode) onYtdlpExit(slot, exitCode) end,
+      makeStreamCallback(slot),
+      buildArgs(slot.url, slot.audioOnly, slot.workDir, slot.useCookies)
+  )
+
+  if not task then
+      if slot.watchdog then slot.watchdog:stop(); slot.watchdog = nil end
+      return false
+  end
+
+  slot.task = task
+  task:start()
+  return true
+end
+
 processQueue = function()
   updateMenu()
 
@@ -1295,6 +1393,7 @@ processQueue = function()
 
       if not activeSlots[key] then
           slotCounter = slotCounter + 1
+          local startWithCookies = REMEMBER_COOKIE_HOSTS and cookieHosts[domainKey(item.url)] or false
           local slot = {
               key       = key,
               url       = item.url,
@@ -1304,24 +1403,15 @@ processQueue = function()
               partial   = { out = "", err = "" },
               log       = {},
               workDir   = string.format("%s/%d-%d", WORK_ROOT, os.time(), slotCounter),
+              useCookies        = startWithCookies,   -- false = first attempt without cookies
+              startedWithCookies = startWithCookies,
           }
           os.execute('mkdir -p "' .. slot.workDir .. '"')
           activeSlots[key] = slot
 
           notifyDownloadStarted(item.url, item.audioOnly)
-          armWatchdog(slot)
 
-          local task = hs.task.new(
-              YTDLP,
-              function(exitCode) onYtdlpExit(slot, exitCode) end,
-              makeStreamCallback(slot),
-              buildArgs(item.url, item.audioOnly, slot.workDir)
-          )
-
-          if task then
-              slot.task = task
-              task:start()
-          else
+          if not launchYtdlp(slot) then
               killSlot(slot)
               notifyFailed(item.url, item.audioOnly, "Could not launch yt-dlp")
           end
